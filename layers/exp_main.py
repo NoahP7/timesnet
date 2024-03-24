@@ -1,5 +1,5 @@
 from layers.data_loader import data_provider
-from utils.tools import EarlyStopping, adjust_learning_rate, cal_accuracy
+from utils.tools import EarlyStopping, adjust_learning_rate
 import torch
 import torch.nn as nn
 from torch import optim
@@ -28,9 +28,18 @@ class Exp_Main:
         self.val_loader = data_provider(self.args, 'val')
         self.test_loader = data_provider(self.args, 'test')
 
+        ## build model
         self.model = TimesNet.Model(self.args).float().to(self.device)
         self.model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         self.criterion = nn.BCELoss()  # nn.CrossEntropyLoss()
+
+    def _get_Acc(self, pred, true):
+        pred = torch.Tensor(pred)
+        true = torch.Tensor(true)
+        prediction = pred >= torch.FloatTensor([0.5])
+        correct_prediction = prediction.float() == true
+        accuracy = correct_prediction.sum().item() / len(correct_prediction)
+        return accuracy
 
     def vali(self, val_loader, criterion):
         total_loss = []
@@ -38,31 +47,28 @@ class Exp_Main:
         trues = []
         self.model.eval()
         with torch.no_grad():
-            for i, (batch_x, label, batch_x_mark, batch_y_mark) in enumerate(val_loader):
+            for i, (batch_x, batch_y) in enumerate(val_loader):
                 batch_x = batch_x.float().to(self.device)
-                label = label.float()
-                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y = batch_y.float()
 
-                outputs = self.model(batch_x, batch_x_mark)
+                outputs = self.model(batch_x)
 
                 pred = outputs.detach().cpu()
-                loss = criterion(pred, label)
+                loss = criterion(pred, batch_y)
                 total_loss.append(loss)
 
-                preds.append(outputs.detach())
-                trues.append(label)
+                preds.append(pred.numpy())
+                trues.append(batch_y.numpy())
 
         total_loss = np.average(total_loss)
 
-        preds = torch.cat(preds, 0)
-        trues = torch.cat(trues, 0)
-        probs = torch.nn.functional.softmax(preds)  # (total_samples, num_classes) est. prob. for each class and sample
-        predictions = torch.argmax(probs, dim=1).cpu().numpy()  # (total_samples,) int class index for each sample
-        trues = trues.flatten().cpu().numpy()
-        accuracy = cal_accuracy(predictions, trues)
-
+        val_pred = np.array(preds)
+        val_pred = val_pred.reshape(-1, 1)
+        val_y = np.array(trues)
+        val_y = val_y.reshape(-1, 1)
+        val_Acc = self._get_Acc(val_pred, val_y)
         self.model.train()
-        return total_loss, accuracy
+        return total_loss, val_Acc
 
     def train(self, setting):
 
@@ -79,24 +85,24 @@ class Exp_Main:
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
+            train_pred, train_y = [], []
 
             self.model.train()
             epoch_time = time.time()
 
-            for i, (batch_x, label, batch_x_mark, batch_y_mark) in enumerate(self.train_loader):
+            for i, (batch_x, batch_y) in enumerate(self.train_loader):
                 iter_count += 1
                 self.model_optim.zero_grad()
 
                 batch_x = batch_x.float().to(self.device)
-                label = label.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
 
-                outputs = self.model(batch_x, batch_x_mark)
-                loss = self.criterion(outputs, label)
-
-                # print(outputs.shape, label.shape)
-
+                outputs = self.model(batch_x)
+                loss = self.criterion(outputs, batch_y)
                 train_loss.append(loss.item())
+
+                train_pred.append(outputs.detach().cpu().numpy())
+                train_y.append(batch_y.detach().cpu().numpy())
 
                 if (i + 1) % 100 == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
@@ -112,13 +118,18 @@ class Exp_Main:
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
-            vali_loss, val_accuracy = self.vali(self.val_loader, self.criterion)
-            test_loss, test_accuracy = self.vali(self.test_loader, self.criterion)
+            val_loss, val_Acc = self.vali(self.val_loader, self.criterion)
+            test_loss, test_Acc = self.vali(self.test_loader, self.criterion)
 
-            print(
-                "Epoch: {0}, Steps: {1} | Train Loss: {2:.3f} Vali Loss: {3:.3f} Vali Acc: {4:.3f} Test Loss: {5:.3f} Test Acc: {6:.3f}"
-                .format(epoch + 1, train_steps, train_loss, vali_loss, val_accuracy, test_loss, test_accuracy))
-            early_stopping(-val_accuracy, self.model, path)
+            train_pred = np.array(train_pred)
+            train_pred = train_pred.reshape(-1, 1)
+            train_y = np.array(train_y)
+            train_y = train_y.reshape(-1, 1)
+            train_Acc = self._get_Acc(train_pred, train_y)
+            print("Epoch: %d, Steps: %d | Train Loss: %.5f Train Acc: %.5f Vali Loss: %.5f Vali Acc: %.5f Test Loss: %.5f Test Acc: %.5f" %
+                  (epoch + 1, train_steps, train_loss, train_Acc, val_loss, val_Acc, test_loss, test_Acc))
+
+            early_stopping(-val_Acc, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
@@ -143,35 +154,19 @@ class Exp_Main:
 
         self.model.eval()
         with torch.no_grad():
-            for i, (batch_x, label, batch_x_mark, batch_y_mark) in enumerate(self.test_loader):
+            for i, (batch_x, batch_y) in enumerate(self.test_loader):
                 batch_x = batch_x.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y = batch_y.float()
 
-                outputs = self.model(batch_x, batch_x_mark)
+                outputs = self.model(batch_x)
 
-                preds.append(outputs.detach())
-                trues.append(label)
+                preds.append(outputs.detach().cpu().numpy())
+                trues.append(batch_y.numpy())
 
-        preds = torch.cat(preds, 0)
-        trues = torch.cat(trues, 0)
-        print('test shape:', preds.shape, trues.shape)
-
-        probs = torch.nn.functional.softmax(preds)  # (total_samples, num_classes) est. prob. for each class and sample
-        predictions = torch.argmax(probs, dim=1).cpu().numpy()  # (total_samples,) int class index for each sample
-        trues = trues.flatten().cpu().numpy()
-        accuracy = cal_accuracy(predictions, trues)
-
-        # result save
-        folder_path = './results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
-
-        print('accuracy:{}'.format(accuracy))
-        file_name='result_classification.txt'
-        f = open(os.path.join(folder_path,file_name), 'a')
-        f.write(setting + "  \n")
-        f.write('accuracy:{}'.format(accuracy))
-        f.write('\n')
-        f.write('\n')
-        f.close()
+        preds = np.array(preds)
+        preds = preds.reshape(-1, 1)
+        trues = np.array(trues)
+        trues = trues.reshape(-1, 1)
+        test_Acc = self._get_Acc(preds, trues)
+        print("Test Acc: %.5f" % (test_Acc))
         return
